@@ -57,6 +57,12 @@ The PyQt6 menu also has a checkbox for older free-text news. This mode is best-e
 it searches the configured news domains, reads article text, and extracts bank/term/rate
 pairs into the same Excel layout with source URLs for review.
 
+Legacy sources currently include VietnamFinance, Timo, InfoNet/Vietnamnet, Thanh Nien,
+Thanh Tra, VnEconomy, The Saigon Times, Tin nhanh chung khoan, Bao Dau Tu, Dan Tri,
+CafeF, Lao Dong, Tuoi Tre, VietnamPlus, and Thoi Bao Tai Chinh Viet Nam. Articles that
+only say a broad range such as "from 4.2% to 6.5%" without a specific term are logged
+but skipped, so the workbook does not contain guessed rates.
+
 The workbook contains:
 
 - `Summary`: run totals and source info

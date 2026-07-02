@@ -32,41 +32,73 @@ STANDARD_MONTHS = [1, 3, 6, 9, 12, 18]
 ProgressCallback = Callable[[str, dict[str, object]], None]
 VIETNAMNET_START_DATE = date(2023, 5, 31)
 LEGACY_DOMAINS = [
+    "cafef.vn",
+    "dantri.com.vn",
+    "infonet.vietnamnet.vn",
+    "laodong.vn",
     "thanhnien.vn",
     "thanhtra.com.vn",
-    "vneconomy.vn",
+    "thoibaotaichinhvietnam.vn",
     "thesaigontimes.vn",
+    "timo.vn",
     "tinnhanhchungkhoan.vn",
-    "vietnamfinance.vn",
+    "tuoitre.vn",
     "baodautu.vn",
+    "vietnamfinance.vn",
+    "vietnamnet.vn",
+    "vietnamplus.vn",
+    "vneconomy.vn",
 ]
 BANK_ALIASES = {
-    "AGRIBANK": ["agribank", "ngan hang nong nghiep"],
+    "ABBANK": ["abbank", "an binh bank", "ngan hang an binh"],
+    "AGRIBANK": [
+        "agribank",
+        "ngan hang nong nghiep",
+        "ngan hang nnptnt",
+        "nh nnptnt",
+        "nnptnt",
+    ],
     "BIDV": ["bidv"],
-    "VIETCOMBANK": ["vietcombank", "vcb"],
-    "VIETINBANK": ["vietinbank"],
+    "VIETCOMBANK": ["vietcombank", "vcb", "ngan hang ngoai thuong"],
+    "VIETINBANK": ["vietinbank", "vietin bank", "ngan hang cong thuong"],
     "ACB": ["acb"],
     "MBBANK": ["mbbank", "mb bank", "ngan hang quan doi"],
     "SACOMBANK": ["sacombank"],
     "TECHCOMBANK": ["techcombank"],
     "VPBANK": ["vpbank"],
     "EXIMBANK": ["eximbank"],
+    "GPBANK": ["gpbank"],
     "HDBANK": ["hdbank"],
     "SHB": ["shb"],
-    "VIB": ["vib"],
-    "OCB": ["ocb"],
-    "MSB": ["msb"],
+    "VIB": ["vib", "vibbank", "vib bank", "ngan hang quoc te"],
+    "OCB": ["ocb", "ngan hang phuong dong"],
+    "MSB": ["msb", "maritimebank", "maritime bank"],
     "SCB": ["scb"],
     "SEABANK": ["seabank"],
     "NAM A BANK": ["nam a bank", "namabank"],
-    "NCB": ["ncb"],
+    "NCB": ["ncb", "ngan hang quoc dan"],
     "PVCOMBANK": ["pvcombank"],
-    "BAC A BANK": ["bac a bank", "baca bank", "bacabank"],
+    "BAC A BANK": ["bac a bank", "baca bank", "bacabank", "ngan hang bac a", "bac a"],
     "PGBANK": ["pgbank"],
     "VIET A BANK": ["viet a bank", "vietabank"],
     "VIETBANK": ["vietbank"],
     "KIENLONGBANK": ["kienlongbank"],
     "BAOVIETBANK": ["baovietbank", "bao viet bank"],
+    "BVBANK": [
+        "bvbank",
+        "bv bank",
+        "ban viet bank",
+        "banvietbank",
+        "ngan hang ban viet",
+        "viet capital bank",
+    ],
+    "LPBANK": ["lpbank", "lienvietpostbank", "lien viet post bank"],
+    "MBV": ["mbv"],
+    "SAIGONBANK": ["saigonbank"],
+    "TPBANK": ["tpbank", "tienphongbank", "tien phong bank", "ngan hang tien phong"],
+    "VCBNEO": ["vcbneo"],
+    "VIKKI BANK": ["vikki bank", "vikkibank"],
+    "TIMO": ["timo", "timo digital bank", "ngan hang so timo"],
 }
 
 
@@ -542,13 +574,41 @@ def google_search_links(
     return links
 
 
-def banks_in_text(value: str) -> list[str]:
+def alias_positions(folded_text: str, alias: str) -> list[int]:
+    folded_alias = fold_text(alias)
+    if not folded_alias:
+        return []
+    pattern = re.compile(rf"(?<![a-z0-9]){re.escape(folded_alias)}(?![a-z0-9])")
+    return [match.start() for match in pattern.finditer(folded_text)]
+
+
+def bank_matches_in_text(value: str) -> list[tuple[int, int, str]]:
     folded = fold_text(value)
-    banks: list[str] = []
+    matches: list[tuple[int, int, str]] = []
     for bank, aliases in BANK_ALIASES.items():
-        if any(alias in folded for alias in aliases):
-            banks.append(bank)
+        for alias in aliases:
+            for position in alias_positions(folded, alias):
+                matches.append((position, -len(fold_text(alias)), bank))
+    matches.sort()
+    return matches
+
+
+def banks_in_text(value: str) -> list[str]:
+    banks: list[str] = []
+    seen: set[str] = set()
+    for _, _, bank in bank_matches_in_text(value):
+        if bank in seen:
+            continue
+        banks.append(bank)
+        seen.add(bank)
     return banks
+
+
+def canonical_bank_name(value: str) -> str | None:
+    matches = bank_matches_in_text(value)
+    if matches:
+        return matches[0][2]
+    return None
 
 
 def split_legacy_blocks(text: str) -> list[str]:
@@ -602,6 +662,17 @@ def extract_term_rates(block: str) -> dict[int, float]:
             continue
         for term in terms:
             rates[term] = rate
+
+    rate_before_pattern = re.compile(
+        r"(\d{1,2}(?:[,.]\d{1,2})?)\s*%"
+        r"(?:\s*/\s*nam)?\s*(?:cho|danh\s+cho|ap\s+dung\s+cho|voi)?\s*"
+        r"(?:ky\s+han\s*)?(\d{1,2})\s*thang"
+    )
+    for match in rate_before_pattern.finditer(folded):
+        rate = parse_rate(match.group(1))
+        term = int(match.group(2))
+        if term in STANDARD_MONTHS and rate is not None and rate <= 20:
+            rates[term] = rate
     return rates
 
 
@@ -620,17 +691,158 @@ def legacy_rate_targets(block: str, mentioned: list[str]) -> list[str]:
 
     banks_before_rate: list[str] = []
     for bank in mentioned:
-        alias_positions = [
-            folded.find(alias)
+        positions = [
+            position
             for alias in BANK_ALIASES.get(bank, [])
-            if folded.find(alias) >= 0
+            for position in alias_positions(folded, alias)
         ]
-        if alias_positions and min(alias_positions) < first_percent:
+        if positions and min(positions) < first_percent:
             banks_before_rate.append(bank)
     return banks_before_rate or [mentioned[0]]
 
 
-def extract_legacy_records(
+def extract_rates_from_cells(cells: list[str]) -> list[float | None]:
+    values: list[float | None] = []
+    for cell in cells:
+        value = parse_rate(cell)
+        values.append(value if value is None or value <= 20 else None)
+    return values
+
+
+def split_inline_rate_cells(value: str) -> list[str]:
+    if "\t" in value:
+        return [cell for cell in re.split(r"\t+", value) if clean_text(cell)]
+    if re.search(r"\d+[,.]\d+\s+\d+[,.]?\d*", value):
+        return re.findall(r"\d{1,2}(?:[,.]\d{1,2})?", value)
+    return [value]
+
+
+def collect_table_header(lines: list[str], start: int) -> tuple[list[int], int] | None:
+    header_terms: list[int] = []
+    cursor = start + 1
+    while cursor < len(lines) and cursor <= start + 12:
+        month = month_from_header(lines[cursor])
+        if month is None:
+            break
+        header_terms.append(month)
+        cursor += 1
+    if len(header_terms) < 3:
+        return None
+    return header_terms, cursor
+
+
+def extract_linear_legacy_tables(
+    title: str,
+    text: str,
+    source_url: str,
+    article_date: date | None,
+) -> list[RateRecord]:
+    lines = [
+        re.sub(r"[ \r\f\v]+", " ", line).strip()
+        for line in repair_mojibake(text).splitlines()
+    ]
+    lines = [line for line in lines if line]
+    records: list[RateRecord] = []
+    seen_rows: set[tuple[str, tuple[tuple[int, float | None], ...]]] = set()
+    row_order = 1
+
+    def finish_row(bank: str | None, values: list[float | None], header_terms: list[int]) -> None:
+        nonlocal row_order
+        if not bank or not values:
+            return
+        rates: dict[int, float | None] = {}
+        for index, month in enumerate(header_terms):
+            if month not in STANDARD_MONTHS or index >= len(values):
+                continue
+            rates[month] = values[index]
+        if not any(value is not None for value in rates.values()):
+            return
+        key = (bank, tuple(sorted(rates.items())))
+        if key in seen_rows:
+            return
+        seen_rows.add(key)
+        records.append(
+            RateRecord(
+                article_date=article_date,
+                bank=bank,
+                rates=rates,
+                source_title=title,
+                source_url=source_url,
+                table_title="Legacy copied table",
+                row_order=row_order,
+            )
+        )
+        row_order += 1
+
+    index = 0
+    while index < len(lines):
+        if "ngan hang" not in fold_text(lines[index]):
+            index += 1
+            continue
+        header = collect_table_header(lines, index)
+        if header is None:
+            index += 1
+            continue
+        if records:
+            break
+
+        header_terms, cursor = header
+        current_bank: str | None = None
+        current_values: list[float | None] = []
+
+        while cursor < len(lines):
+            line = lines[cursor]
+            folded = fold_text(line)
+            if "ngan hang" in folded and collect_table_header(lines, cursor):
+                finish_row(current_bank, current_values, header_terms)
+                break
+            if folded.startswith("tiep tuc cap nhat"):
+                finish_row(current_bank, current_values, header_terms)
+                break
+
+            bank = canonical_bank_name(line)
+            cells = re.split(r"\t+", line) if "\t" in line else [line]
+            first_cell_bank = canonical_bank_name(cells[0]) if cells else None
+            if first_cell_bank:
+                bank = first_cell_bank
+
+            if bank:
+                finish_row(current_bank, current_values, header_terms)
+                current_bank = bank
+                current_values = []
+                if len(cells) > 1:
+                    current_values.extend(extract_rates_from_cells(cells[1:]))
+                else:
+                    first_rate = re.search(r"\d{1,2}(?:[,.]\d{1,2})?", line)
+                    if first_rate and first_rate.start() > 0:
+                        current_values.extend(
+                            extract_rates_from_cells(split_inline_rate_cells(line[first_rate.start() :]))
+                        )
+                cursor += 1
+                continue
+
+            if current_bank:
+                if "\t" in line:
+                    current_values.extend(extract_rates_from_cells(split_inline_rate_cells(line)))
+                elif re.match(r"^\d{1,2}(?:[,.]\d{1,2})?", line):
+                    cells = split_inline_rate_cells(line)
+                    if len(cells) > 1:
+                        current_values.extend(extract_rates_from_cells(cells))
+                    else:
+                        value = parse_rate(line)
+                        if value is not None and value <= 20:
+                            current_values.append(value)
+                if len(current_values) >= len(header_terms):
+                    current_values = current_values[: len(header_terms)]
+            cursor += 1
+
+        finish_row(current_bank, current_values, header_terms)
+        index = cursor + 1
+
+    return records
+
+
+def extract_legacy_text_records(
     title: str,
     text: str,
     source_url: str,
@@ -672,6 +884,26 @@ def extract_legacy_records(
             )
         )
     return records
+
+
+def extract_legacy_records(
+    title: str,
+    text: str,
+    source_url: str,
+    article_date: date | None,
+) -> list[RateRecord]:
+    table_records = extract_linear_legacy_tables(title, text, source_url, article_date)
+    text_records = extract_legacy_text_records(title, text, source_url, article_date)
+    if not table_records:
+        return text_records
+
+    table_banks = {record.bank for record in table_records}
+    extra_text_records = [
+        record for record in text_records if record.bank not in table_banks
+    ]
+    for offset, record in enumerate(extra_text_records, start=len(table_records) + 1):
+        record.row_order = offset
+    return table_records + extra_text_records
 
 
 def scrape_legacy_article(
