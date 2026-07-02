@@ -50,7 +50,7 @@ Useful options:
 Legacy free-text search for older articles before Vietnamnet table coverage:
 
 ```powershell
-.\.venv\Scripts\python.exe app.py --legacy --legacy-from-year 2015 --legacy-to-year 2023
+.\.venv\Scripts\python.exe app.py --legacy --legacy-from-year 2017 --legacy-to-year 2022
 ```
 
 The PyQt6 menu also has a checkbox for older free-text news. This mode is best-effort:
@@ -62,6 +62,10 @@ Thanh Tra, VnEconomy, The Saigon Times, Tin nhanh chung khoan, Bao Dau Tu, Dan T
 CafeF, Lao Dong, Tuoi Tre, VietnamPlus, and Thoi Bao Tai Chinh Viet Nam. Articles that
 only say a broad range such as "from 4.2% to 6.5%" without a specific term are logged
 but skipped, so the workbook does not contain guessed rates.
+
+Legacy search checks InfoNet/Vietnamnet and CafeF first, then searches the wider source
+list. InfoNet copied tables from 2017-2022 are parsed with support for `KKH`, `1 month`,
+`3 month`, `6 month`, `9 month`, `12 month`, `24 month`, and `36 month` columns.
 
 The workbook contains:
 

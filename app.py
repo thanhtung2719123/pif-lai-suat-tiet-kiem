@@ -49,6 +49,7 @@ LEGACY_DOMAINS = [
     "vietnamplus.vn",
     "vneconomy.vn",
 ]
+LEGACY_PRIORITY_DOMAINS = ["infonet.vietnamnet.vn", "cafef.vn"]
 BANK_ALIASES = {
     "ABBANK": ["abbank", "an binh bank", "ngan hang an binh"],
     "AGRIBANK": [
@@ -65,7 +66,7 @@ BANK_ALIASES = {
     "MBBANK": ["mbbank", "mb bank", "ngan hang quan doi"],
     "SACOMBANK": ["sacombank"],
     "TECHCOMBANK": ["techcombank"],
-    "VPBANK": ["vpbank"],
+    "VPBANK": ["vpbank", "vp bank"],
     "EXIMBANK": ["eximbank"],
     "GPBANK": ["gpbank"],
     "HDBANK": ["hdbank"],
@@ -84,6 +85,7 @@ BANK_ALIASES = {
     "VIETBANK": ["vietbank"],
     "KIENLONGBANK": ["kienlongbank"],
     "BAOVIETBANK": ["baovietbank", "bao viet bank"],
+    "DONG A BANK": ["dong a bank", "dongabank", "donga bank", "dong a"],
     "BVBANK": [
         "bvbank",
         "bv bank",
@@ -92,7 +94,13 @@ BANK_ALIASES = {
         "ngan hang ban viet",
         "viet capital bank",
     ],
-    "LPBANK": ["lpbank", "lienvietpostbank", "lien viet post bank"],
+    "LPBANK": [
+        "lpbank",
+        "lienvietpostbank",
+        "lienviet post bank",
+        "lien viet post bank",
+        "lienvietpost bank",
+    ],
     "MBV": ["mbv"],
     "SAIGONBANK": ["saigonbank"],
     "TPBANK": ["tpbank", "tienphongbank", "tien phong bank", "ngan hang tien phong"],
@@ -213,13 +221,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--legacy-from-year",
         type=int,
-        default=2015,
+        default=2017,
         help="First year for legacy source search.",
     )
     parser.add_argument(
         "--legacy-to-year",
         type=int,
-        default=2023,
+        default=2022,
         help="Last year for legacy source search.",
     )
     parser.add_argument(
@@ -539,38 +547,50 @@ def google_search_links(
     period_start: date,
     period_end_exclusive: date,
 ) -> list[str]:
-    site_query = " OR ".join(f"site:{domain}" for domain in LEGACY_DOMAINS)
-    query = (
-        f"({site_query}) \"lãi suất\" "
-        f"after:{period_start:%Y-%m-%d} before:{period_end_exclusive:%Y-%m-%d}"
-    )
-    url = f"https://www.google.com/search?q={quote_plus(query)}&num={args.legacy_max_results}&hl=vi"
-    try:
-        html = fetch_html(
-            session,
-            url,
-            Path(args.cache_dir) / "legacy_google",
-            args.timeout,
-            args.refresh,
-            args.delay,
-        )
-    except Exception:
-        return []
-
-    soup = BeautifulSoup(html, "lxml")
     links: list[str] = []
     seen: set[str] = set()
-    for anchor in soup.select("a[href]"):
-        raw_link = google_result_url(anchor.get("href", ""))
-        if not raw_link:
+    priority = [domain for domain in LEGACY_PRIORITY_DOMAINS if domain in LEGACY_DOMAINS]
+    remaining = [domain for domain in LEGACY_DOMAINS if domain not in priority]
+    domain_groups = [[domain] for domain in priority] + [remaining]
+
+    for domains in domain_groups:
+        if not domains:
             continue
-        link = canonical_url(raw_link)
-        if not link or not allowed_legacy_url(link) or link in seen:
+        site_query = " OR ".join(f"site:{domain}" for domain in domains)
+        query = (
+            f"({site_query}) \"lãi suất\" "
+            f"after:{period_start:%Y-%m-%d} before:{period_end_exclusive:%Y-%m-%d}"
+        )
+        url = (
+            "https://www.google.com/search?"
+            f"q={quote_plus(query)}&num={args.legacy_max_results}&hl=vi"
+        )
+        try:
+            html = fetch_html(
+                session,
+                url,
+                Path(args.cache_dir) / "legacy_google",
+                args.timeout,
+                args.refresh,
+                args.delay,
+            )
+        except Exception:
             continue
-        links.append(link)
-        seen.add(link)
-        if len(links) >= args.legacy_max_results:
-            break
+
+        soup = BeautifulSoup(html, "lxml")
+        group_count = 0
+        for anchor in soup.select("a[href]"):
+            raw_link = google_result_url(anchor.get("href", ""))
+            if not raw_link:
+                continue
+            link = canonical_url(raw_link)
+            if not link or not allowed_legacy_url(link) or link in seen:
+                continue
+            links.append(link)
+            seen.add(link)
+            group_count += 1
+            if group_count >= args.legacy_max_results:
+                break
     return links
 
 
@@ -717,18 +737,40 @@ def split_inline_rate_cells(value: str) -> list[str]:
     return [value]
 
 
-def collect_table_header(lines: list[str], start: int) -> tuple[list[int], int] | None:
-    header_terms: list[int] = []
+def collect_table_header(lines: list[str], start: int) -> tuple[list[int | None], int] | None:
+    header_terms: list[int | None] = []
     cursor = start + 1
-    while cursor < len(lines) and cursor <= start + 12:
+    while cursor < len(lines) and cursor <= start + 16:
+        folded = fold_text(lines[cursor])
+        if (folded.startswith("lai suat") and "thang" not in folded) or folded == "%/nam":
+            cursor += 1
+            continue
+        if folded in {"kkh", "khong ky han", "khong ki han"}:
+            header_terms.append(None)
+            cursor += 1
+            continue
         month = month_from_header(lines[cursor])
         if month is None:
             break
         header_terms.append(month)
         cursor += 1
-    if len(header_terms) < 3:
+    if sum(1 for month in header_terms if month is not None) < 3:
         return None
     return header_terms, cursor
+
+
+def align_legacy_table_values(
+    values: list[float | None],
+    header_terms: list[int | None],
+) -> list[float | None]:
+    aligned = values[:]
+    if header_terms and header_terms[0] is None and aligned:
+        first_rate = next((value for value in aligned if value is not None), None)
+        if first_rate is not None and first_rate > 2 and len(aligned) < len(header_terms):
+            aligned = [None] + aligned
+    if len(aligned) < len(header_terms):
+        aligned.extend([None] * (len(header_terms) - len(aligned)))
+    return aligned[: len(header_terms)]
 
 
 def extract_linear_legacy_tables(
@@ -746,15 +788,20 @@ def extract_linear_legacy_tables(
     seen_rows: set[tuple[str, tuple[tuple[int, float | None], ...]]] = set()
     row_order = 1
 
-    def finish_row(bank: str | None, values: list[float | None], header_terms: list[int]) -> None:
+    def finish_row(
+        bank: str | None,
+        values: list[float | None],
+        header_terms: list[int | None],
+    ) -> None:
         nonlocal row_order
         if not bank or not values:
             return
+        aligned_values = align_legacy_table_values(values, header_terms)
         rates: dict[int, float | None] = {}
         for index, month in enumerate(header_terms):
-            if month not in STANDARD_MONTHS or index >= len(values):
+            if month not in STANDARD_MONTHS or index >= len(aligned_values):
                 continue
-            rates[month] = values[index]
+            rates[month] = aligned_values[index]
         if not any(value is not None for value in rates.values()):
             return
         key = (bank, tuple(sorted(rates.items())))
