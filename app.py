@@ -566,29 +566,41 @@ def is_vnd_savings_context(value: str) -> bool:
 def extract_term_rates(block: str) -> dict[int, float]:
     rates: dict[int, float] = {}
     folded = fold_text(block)
-    patterns = [
-        (
-            r"(?:ky han\s*)?(\d{1,2})\s*thang[^.%]{0,90}?(\d{1,2}(?:[,.]\d{1,2})?)\s*%",
-            "term_rate",
-        ),
-        (
-            r"(\d{1,2}(?:[,.]\d{1,2})?)\s*%[^.]{0,90}?(\d{1,2})\s*thang",
-            "rate_term",
-        ),
-    ]
-    for pattern, order in patterns:
-        for match in re.finditer(pattern, folded):
-            first, second = match.groups()
-            if order == "term_rate":
-                term_s, rate_s = first, second
-            else:
-                rate_s, term_s = first, second
-            term = int(term_s)
-            if term not in STANDARD_MONTHS:
-                continue
-            rate = parse_rate(rate_s)
-            if rate is None or rate > 20:
-                continue
+    term_pattern = re.compile(
+        r"(?:tu\s*)?(\d{1,2})\s*(?:[-–]\s*(\d{1,2}))?\s*thang"
+    )
+    matches = list(term_pattern.finditer(folded))
+
+    def standard_terms(start_term: int, end_term: int | None) -> list[int]:
+        if end_term is None:
+            return [start_term] if start_term in STANDARD_MONTHS else []
+        low, high = sorted((start_term, end_term))
+        return [term for term in STANDARD_MONTHS if low <= term <= high]
+
+    def current_rate(segment: str) -> float | None:
+        preferred = re.search(
+            r"(?:xuong\s+con|giam\s+con|con|la|chi)\s*(\d{1,2}(?:[,.]\d{1,2})?)\s*%",
+            segment,
+        )
+        if preferred:
+            return parse_rate(preferred.group(1))
+        candidates = re.findall(r"(\d{1,2}(?:[,.]\d{1,2})?)\s*%", segment)
+        if not candidates:
+            return None
+        return parse_rate(candidates[-1] if "xuong" in segment or "giam" in segment else candidates[0])
+
+    for index, match in enumerate(matches):
+        start_term = int(match.group(1))
+        end_term = int(match.group(2)) if match.group(2) else None
+        terms = standard_terms(start_term, end_term)
+        if not terms:
+            continue
+        next_start = matches[index + 1].start() if index + 1 < len(matches) else len(folded)
+        segment = folded[match.end() : min(next_start, match.end() + 180)]
+        rate = current_rate(segment)
+        if rate is None or rate > 20:
+            continue
+        for term in terms:
             rates[term] = rate
     return rates
 
@@ -605,11 +617,17 @@ def extract_legacy_records(
 
     for block in split_legacy_blocks(text):
         mentioned = banks_in_text(block)
+        rates = extract_term_rates(block) if is_vnd_savings_context(block) else {}
+        if mentioned and rates:
+            for bank in mentioned:
+                bank_rates.setdefault(bank, {})
+                bank_rates[bank].update(rates)
+            active_bank = mentioned[0] if len(mentioned) == 1 else active_bank
+            continue
         if mentioned:
             active_bank = mentioned[0] if len(mentioned) == 1 else None
         if not active_bank or not is_vnd_savings_context(block):
             continue
-        rates = extract_term_rates(block)
         if not rates:
             continue
         bank_rates.setdefault(active_bank, {})
