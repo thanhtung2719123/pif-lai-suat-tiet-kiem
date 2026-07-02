@@ -605,6 +605,31 @@ def extract_term_rates(block: str) -> dict[int, float]:
     return rates
 
 
+def legacy_rate_targets(block: str, mentioned: list[str]) -> list[str]:
+    if len(mentioned) <= 1:
+        return mentioned
+
+    folded = fold_text(block)
+    contrast_tokens = ("trong khi", "so voi", "khac", "nhu ")
+    if not any(token in folded for token in contrast_tokens):
+        return mentioned
+
+    first_percent = folded.find("%")
+    if first_percent < 0:
+        return [mentioned[0]]
+
+    banks_before_rate: list[str] = []
+    for bank in mentioned:
+        alias_positions = [
+            folded.find(alias)
+            for alias in BANK_ALIASES.get(bank, [])
+            if folded.find(alias) >= 0
+        ]
+        if alias_positions and min(alias_positions) < first_percent:
+            banks_before_rate.append(bank)
+    return banks_before_rate or [mentioned[0]]
+
+
 def extract_legacy_records(
     title: str,
     text: str,
@@ -619,7 +644,7 @@ def extract_legacy_records(
         mentioned = banks_in_text(block)
         rates = extract_term_rates(block) if is_vnd_savings_context(block) else {}
         if mentioned and rates:
-            for bank in mentioned:
+            for bank in legacy_rate_targets(block, mentioned):
                 bank_rates.setdefault(bank, {})
                 bank_rates[bank].update(rates)
             active_bank = mentioned[0] if len(mentioned) == 1 else active_bank
