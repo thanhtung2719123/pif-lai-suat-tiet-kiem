@@ -10,6 +10,7 @@ from PyQt6.QtGui import QFont, QIcon, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -141,6 +142,17 @@ class PassionInvestmentWindow(QMainWindow):
 
         self.refresh_checkbox = QCheckBox("Refresh downloaded pages instead of cache")
 
+        self.legacy_checkbox = QCheckBox("Search older free-text news before 31/5/2023")
+        self.legacy_from_year_spin = QSpinBox()
+        self.legacy_from_year_spin.setRange(2015, 2023)
+        self.legacy_from_year_spin.setValue(2015)
+        self.legacy_to_year_spin = QSpinBox()
+        self.legacy_to_year_spin.setRange(2015, 2023)
+        self.legacy_to_year_spin.setValue(2023)
+        self.legacy_period_combo = QComboBox()
+        self.legacy_period_combo.addItem("Monthly search", "month")
+        self.legacy_period_combo.addItem("Daily search", "day")
+
         form.addWidget(self._field_label("Pages to scan"), 0, 0)
         form.addWidget(self.pages_spin, 0, 1)
         form.addWidget(self._field_label("Stop after empty pages"), 1, 0)
@@ -149,6 +161,13 @@ class PassionInvestmentWindow(QMainWindow):
         form.addWidget(self.output_edit, 2, 1)
         form.addWidget(browse_button, 2, 2)
         form.addWidget(self.refresh_checkbox, 3, 0, 1, 3)
+        form.addWidget(self.legacy_checkbox, 4, 0, 1, 3)
+        form.addWidget(self._field_label("Legacy from year"), 5, 0)
+        form.addWidget(self.legacy_from_year_spin, 5, 1)
+        form.addWidget(self._field_label("Legacy to year"), 6, 0)
+        form.addWidget(self.legacy_to_year_spin, 6, 1)
+        form.addWidget(self._field_label("Legacy search pace"), 7, 0)
+        form.addWidget(self.legacy_period_combo, 7, 1)
 
         controls_layout.addLayout(form)
 
@@ -267,6 +286,15 @@ class PassionInvestmentWindow(QMainWindow):
             QLineEdit:focus, QSpinBox:focus, QTextEdit:focus {
                 border: 2px solid #18a14b;
             }
+            QComboBox {
+                background: #fcfffd;
+                border: 1px solid #b7dcc3;
+                border-radius: 12px;
+                padding: 10px 12px;
+            }
+            QComboBox:focus {
+                border: 2px solid #18a14b;
+            }
             QCheckBox {
                 spacing: 8px;
                 color: #2f6042;
@@ -369,10 +397,25 @@ class PassionInvestmentWindow(QMainWindow):
             timeout=25,
             max_articles=0,
             stop_after_empty=self.stop_empty_spin.value(),
-            date_from="",
-            date_to="",
+            date_from=(
+                f"{self.legacy_from_year_spin.value()}-01-01"
+                if self.legacy_checkbox.isChecked()
+                else ""
+            ),
+            date_to=(
+                f"{self.legacy_to_year_spin.value()}-12-31"
+                if self.legacy_checkbox.isChecked()
+                else ""
+            ),
             verbose=False,
             quiet=True,
+            legacy=self.legacy_checkbox.isChecked(),
+            legacy_from_year=self.legacy_from_year_spin.value(),
+            legacy_to_year=self.legacy_to_year_spin.value(),
+            legacy_period=self.legacy_period_combo.currentData(),
+            legacy_max_results=10,
+            legacy_max_articles=0,
+            legacy_only=False,
         )
 
         self.thread = QThread()
@@ -414,6 +457,33 @@ class PassionInvestmentWindow(QMainWindow):
             self.article_progress.setMaximum(total_links)
             self.summary_label.setText(str(data.get("message", "")))
             self.log_box.append(str(data.get("message", "")))
+            return
+
+        if event == "legacy_period":
+            done = int(data.get("done", 0))
+            total = max(int(data.get("total", 1)), 1)
+            self.page_progress.setMaximum(total)
+            self.page_progress.setValue(min(done, total))
+            message = (
+                f"Legacy search {done}/{total}: {data.get('period', '')} "
+                f"found {int(data.get('links', 0))} candidate links."
+            )
+            self.stage_label.setText("Searching legacy sources")
+            self.summary_label.setText(message)
+            self.log_box.append(message)
+            return
+
+        if event == "legacy_article":
+            done = int(data.get("done", 0))
+            total = max(int(data.get("total", done or 1)), 1)
+            self.article_progress.setMaximum(total)
+            self.article_progress.setValue(min(done, total))
+            status = str(data.get("status", ""))
+            rows = int(data.get("rows", 0))
+            title = str(data.get("title", ""))
+            message = f"Legacy article {done}/{total} | {status} | {rows} rows | {title}"
+            self.summary_label.setText(message)
+            self.log_box.append(message)
             return
 
         if event == "article":

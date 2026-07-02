@@ -8,10 +8,10 @@ import sys
 import time
 import unicodedata
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Callable, Iterable
-from urllib.parse import urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qs, quote_plus, urljoin, urlsplit, urlunsplit
 
 import requests
 from bs4 import BeautifulSoup, Tag
@@ -30,6 +30,44 @@ USER_AGENT = (
 )
 STANDARD_MONTHS = [1, 3, 6, 9, 12, 18]
 ProgressCallback = Callable[[str, dict[str, object]], None]
+VIETNAMNET_START_DATE = date(2023, 5, 31)
+LEGACY_DOMAINS = [
+    "thanhnien.vn",
+    "thanhtra.com.vn",
+    "vneconomy.vn",
+    "thesaigontimes.vn",
+    "tinnhanhchungkhoan.vn",
+    "vietnamfinance.vn",
+    "baodautu.vn",
+]
+BANK_ALIASES = {
+    "AGRIBANK": ["agribank", "ngan hang nong nghiep"],
+    "BIDV": ["bidv"],
+    "VIETCOMBANK": ["vietcombank", "vcb"],
+    "VIETINBANK": ["vietinbank"],
+    "ACB": ["acb"],
+    "MBBANK": ["mbbank", "mb bank", "ngan hang quan doi"],
+    "SACOMBANK": ["sacombank"],
+    "TECHCOMBANK": ["techcombank"],
+    "VPBANK": ["vpbank"],
+    "EXIMBANK": ["eximbank"],
+    "HDBANK": ["hdbank"],
+    "SHB": ["shb"],
+    "VIB": ["vib"],
+    "OCB": ["ocb"],
+    "MSB": ["msb"],
+    "SCB": ["scb"],
+    "SEABANK": ["seabank"],
+    "NAM A BANK": ["nam a bank", "namabank"],
+    "NCB": ["ncb"],
+    "PVCOMBANK": ["pvcombank"],
+    "BAC A BANK": ["bac a bank", "baca bank", "bacabank"],
+    "PGBANK": ["pgbank"],
+    "VIET A BANK": ["viet a bank", "vietabank"],
+    "VIETBANK": ["vietbank"],
+    "KIENLONGBANK": ["kienlongbank"],
+    "BAOVIETBANK": ["baovietbank", "bao viet bank"],
+}
 
 
 @dataclass(frozen=True)
@@ -134,6 +172,46 @@ def parse_args() -> argparse.Namespace:
         "--quiet",
         action="store_true",
         help="Suppress per-page and per-article progress output.",
+    )
+    parser.add_argument(
+        "--legacy",
+        action="store_true",
+        help="Also search older free-text news sources before Vietnamnet table coverage.",
+    )
+    parser.add_argument(
+        "--legacy-from-year",
+        type=int,
+        default=2015,
+        help="First year for legacy source search.",
+    )
+    parser.add_argument(
+        "--legacy-to-year",
+        type=int,
+        default=2023,
+        help="Last year for legacy source search.",
+    )
+    parser.add_argument(
+        "--legacy-period",
+        choices=("month", "day"),
+        default="month",
+        help="Search legacy sources by month or by day.",
+    )
+    parser.add_argument(
+        "--legacy-max-results",
+        type=int,
+        default=10,
+        help="Max Google results to inspect per legacy period.",
+    )
+    parser.add_argument(
+        "--legacy-max-articles",
+        type=int,
+        default=0,
+        help="Optional cap for fetched legacy articles. 0 means no cap.",
+    )
+    parser.add_argument(
+        "--legacy-only",
+        action="store_true",
+        help="Skip Vietnamnet archive and only run legacy source search.",
     )
     return parser.parse_args()
 
@@ -367,6 +445,275 @@ def parse_published_date(soup: BeautifulSoup) -> date | None:
         if parsed:
             return parsed
     return None
+
+
+def vietnamese_score(value: str) -> int:
+    markers = "ăâđêôơưáàảãạấầẩẫậắằẳẵặéèẻẽẹếềểễệíìỉĩịóòỏõọốồổỗộớờởỡợúùủũụứừửữựýỳỷỹỵ"
+    return sum(1 for char in value.lower() if char in markers)
+
+
+def repair_mojibake(value: str) -> str:
+    try:
+        repaired = value.encode("cp1252", errors="ignore").decode("utf-8", errors="ignore")
+    except UnicodeError:
+        return value
+    return repaired if vietnamese_score(repaired) > vietnamese_score(value) else value
+
+
+def visible_text_from_html(html: str) -> tuple[str, str, date | None]:
+    soup = BeautifulSoup(html, "lxml")
+    for tag in soup(["script", "style", "noscript", "svg"]):
+        tag.decompose()
+    title = clean_text(
+        soup.select_one("h1").get_text(" ", strip=True)
+        if soup.select_one("h1")
+        else (soup.title.get_text(" ", strip=True) if soup.title else "")
+    )
+    text = repair_mojibake(soup.get_text("\n", strip=True))
+    title = repair_mojibake(title)
+    return title, text, parse_published_date(soup)
+
+
+def allowed_legacy_url(url: str) -> bool:
+    host = urlsplit(url).netloc.lower().removeprefix("www.")
+    return any(host == domain or host.endswith(f".{domain}") for domain in LEGACY_DOMAINS)
+
+
+def google_result_url(href: str) -> str:
+    if href.startswith("/url?"):
+        return parse_qs(urlsplit(href).query).get("q", [""])[0]
+    if href.startswith("http"):
+        return href
+    return ""
+
+
+def legacy_period_ranges(start: date, end: date, period: str) -> Iterable[tuple[date, date]]:
+    current = start
+    while current <= end:
+        if period == "day":
+            next_start = current + timedelta(days=1)
+        else:
+            if current.month == 12:
+                next_start = date(current.year + 1, 1, 1)
+            else:
+                next_start = date(current.year, current.month + 1, 1)
+        yield current, min(next_start, end + timedelta(days=1))
+        current = next_start
+
+
+def google_search_links(
+    session: requests.Session,
+    args: argparse.Namespace,
+    period_start: date,
+    period_end_exclusive: date,
+) -> list[str]:
+    site_query = " OR ".join(f"site:{domain}" for domain in LEGACY_DOMAINS)
+    query = (
+        f"({site_query}) \"lãi suất\" "
+        f"after:{period_start:%Y-%m-%d} before:{period_end_exclusive:%Y-%m-%d}"
+    )
+    url = f"https://www.google.com/search?q={quote_plus(query)}&num={args.legacy_max_results}&hl=vi"
+    try:
+        html = fetch_html(
+            session,
+            url,
+            Path(args.cache_dir) / "legacy_google",
+            args.timeout,
+            args.refresh,
+            args.delay,
+        )
+    except Exception:
+        return []
+
+    soup = BeautifulSoup(html, "lxml")
+    links: list[str] = []
+    seen: set[str] = set()
+    for anchor in soup.select("a[href]"):
+        raw_link = google_result_url(anchor.get("href", ""))
+        if not raw_link:
+            continue
+        link = canonical_url(raw_link)
+        if not link or not allowed_legacy_url(link) or link in seen:
+            continue
+        links.append(link)
+        seen.add(link)
+        if len(links) >= args.legacy_max_results:
+            break
+    return links
+
+
+def banks_in_text(value: str) -> list[str]:
+    folded = fold_text(value)
+    banks: list[str] = []
+    for bank, aliases in BANK_ALIASES.items():
+        if any(alias in folded for alias in aliases):
+            banks.append(bank)
+    return banks
+
+
+def split_legacy_blocks(text: str) -> list[str]:
+    blocks = [clean_text(block) for block in re.split(r"[\n\r]+|(?<=[.!?])\s+", text)]
+    return [block for block in blocks if block]
+
+
+def is_vnd_savings_context(value: str) -> bool:
+    folded = fold_text(value)
+    if any(token in folded for token in ("usd", "eur", "ngoai te", "dollar")):
+        return False
+    return any(token in folded for token in ("vnd", "tiet kiem", "huy dong", "tien gui", "ky han"))
+
+
+def extract_term_rates(block: str) -> dict[int, float]:
+    rates: dict[int, float] = {}
+    folded = fold_text(block)
+    patterns = [
+        (
+            r"(?:ky han\s*)?(\d{1,2})\s*thang[^.%]{0,90}?(\d{1,2}(?:[,.]\d{1,2})?)\s*%",
+            "term_rate",
+        ),
+        (
+            r"(\d{1,2}(?:[,.]\d{1,2})?)\s*%[^.]{0,90}?(\d{1,2})\s*thang",
+            "rate_term",
+        ),
+    ]
+    for pattern, order in patterns:
+        for match in re.finditer(pattern, folded):
+            first, second = match.groups()
+            if order == "term_rate":
+                term_s, rate_s = first, second
+            else:
+                rate_s, term_s = first, second
+            term = int(term_s)
+            if term not in STANDARD_MONTHS:
+                continue
+            rate = parse_rate(rate_s)
+            if rate is None or rate > 20:
+                continue
+            rates[term] = rate
+    return rates
+
+
+def extract_legacy_records(
+    title: str,
+    text: str,
+    source_url: str,
+    article_date: date | None,
+) -> list[RateRecord]:
+    detected_from_title = banks_in_text(title)
+    active_bank = detected_from_title[0] if len(detected_from_title) == 1 else None
+    bank_rates: dict[str, dict[int, float | None]] = {}
+
+    for block in split_legacy_blocks(text):
+        mentioned = banks_in_text(block)
+        if mentioned:
+            active_bank = mentioned[0] if len(mentioned) == 1 else None
+        if not active_bank or not is_vnd_savings_context(block):
+            continue
+        rates = extract_term_rates(block)
+        if not rates:
+            continue
+        bank_rates.setdefault(active_bank, {})
+        bank_rates[active_bank].update(rates)
+
+    records: list[RateRecord] = []
+    for row_order, (bank, rates) in enumerate(bank_rates.items(), start=1):
+        records.append(
+            RateRecord(
+                article_date=article_date,
+                bank=bank,
+                rates=rates,
+                source_title=title,
+                source_url=source_url,
+                table_title="Legacy text extraction",
+                row_order=row_order,
+            )
+        )
+    return records
+
+
+def scrape_legacy_article(
+    session: requests.Session,
+    url: str,
+    args: argparse.Namespace,
+) -> tuple[list[RateRecord], ArticleLog]:
+    html = fetch_html(
+        session,
+        url,
+        Path(args.cache_dir) / "legacy_articles",
+        args.timeout,
+        args.refresh,
+        args.delay,
+    )
+    title, text, published_date = visible_text_from_html(html)
+    article_date = (
+        parse_date_from_text(title, default_year=published_date.year if published_date else None)
+        or parse_date_from_url(url)
+        or published_date
+    )
+    records = extract_legacy_records(title, text, url, article_date)
+    status = "ok" if records else "no legacy rates"
+    return records, ArticleLog(
+        article_date=article_date,
+        title=title or url,
+        url=url,
+        status=status,
+        rows=len(records),
+        error="" if records else "No VND bank/term/rate pairs were detected.",
+    )
+
+
+def run_legacy_scrape(
+    session: requests.Session,
+    args: argparse.Namespace,
+    progress_callback: ProgressCallback | None = None,
+) -> tuple[list[RateRecord], list[ArticleLog]]:
+    start = date(args.legacy_from_year, 1, 1)
+    end = min(date(args.legacy_to_year, 12, 31), VIETNAMNET_START_DATE - timedelta(days=1))
+    if start > end:
+        return [], []
+
+    periods = list(legacy_period_ranges(start, end, args.legacy_period))
+    records: list[RateRecord] = []
+    logs: list[ArticleLog] = []
+    seen_urls: set[str] = set()
+    fetched = 0
+
+    for idx, (period_start, period_end) in enumerate(periods, start=1):
+        links = google_search_links(session, args, period_start, period_end)
+        emit_progress(
+            progress_callback,
+            "legacy_period",
+            done=idx,
+            total=len(periods),
+            period=f"{period_start:%Y-%m-%d} to {(period_end - timedelta(days=1)):%Y-%m-%d}",
+            links=len(links),
+        )
+        for url in links:
+            if url in seen_urls:
+                continue
+            if args.legacy_max_articles and fetched >= args.legacy_max_articles:
+                return records, logs
+            seen_urls.add(url)
+            fetched += 1
+            try:
+                article_records, log = scrape_legacy_article(session, url, args)
+            except Exception as exc:  # noqa: BLE001 - keep legacy search moving.
+                log = ArticleLog(None, url, url, "error", error=str(exc))
+                article_records = []
+            records.extend(article_records)
+            logs.append(log)
+            emit_progress(
+                progress_callback,
+                "legacy_article",
+                done=fetched,
+                total=max(fetched, args.legacy_max_articles or fetched),
+                status=log.status,
+                rows=log.rows,
+                title=log.title,
+                url=log.url,
+            )
+
+    return records, logs
 
 
 def parse_iso_date(value: str) -> date | None:
@@ -905,74 +1252,82 @@ def run_scrape(
         raise SystemExit("--date-from must be before --date-to.")
 
     session = make_session()
-    if not args.quiet:
-        print("Collecting article links...")
-    emit_progress(progress_callback, "stage", message="Collecting article links...")
-    links = collect_article_links(session, args, date_from, date_to, progress_callback)
-    if not args.quiet:
-        print(f"Collected {len(links)} unique article links.")
-    emit_progress(
-        progress_callback,
-        "links_ready",
-        total_links=len(links),
-        message=f"Collected {len(links)} unique article links.",
-    )
-
     records: list[RateRecord] = []
     article_logs: list[ArticleLog] = []
-    for idx, link in enumerate(links, start=1):
-        try:
-            article_records, log = scrape_article(session, link, args)
-            records.extend(article_records)
-            article_logs.append(log)
-            if not args.quiet:
-                print(
-                    f"{progress_line(idx, len(links), 'Articles')} | "
-                    f"{log.status}: {log.rows} rows - {log.title}"
+
+    if args.legacy:
+        emit_progress(progress_callback, "stage", message="Searching legacy news sources...")
+        legacy_records, legacy_logs = run_legacy_scrape(session, args, progress_callback)
+        records.extend(legacy_records)
+        article_logs.extend(legacy_logs)
+
+    if not args.legacy_only:
+        if not args.quiet:
+            print("Collecting article links...")
+        emit_progress(progress_callback, "stage", message="Collecting Vietnamnet article links...")
+        links = collect_article_links(session, args, date_from, date_to, progress_callback)
+        if not args.quiet:
+            print(f"Collected {len(links)} unique article links.")
+        emit_progress(
+            progress_callback,
+            "links_ready",
+            total_links=len(links),
+            message=f"Collected {len(links)} unique Vietnamnet article links.",
+        )
+
+        for idx, link in enumerate(links, start=1):
+            try:
+                article_records, log = scrape_article(session, link, args)
+                records.extend(article_records)
+                article_logs.append(log)
+                if not args.quiet:
+                    print(
+                        f"{progress_line(idx, len(links), 'Articles')} | "
+                        f"{log.status}: {log.rows} rows - {log.title}"
+                    )
+                emit_progress(
+                    progress_callback,
+                    "article",
+                    done=idx,
+                    total=len(links),
+                    status=log.status,
+                    rows=log.rows,
+                    title=log.title,
+                    url=log.url,
                 )
-            emit_progress(
-                progress_callback,
-                "article",
-                done=idx,
-                total=len(links),
-                status=log.status,
-                rows=log.rows,
-                title=log.title,
-                url=log.url,
-            )
-        except Exception as exc:  # noqa: BLE001 - continue archive scraping after one bad page.
-            article_date = parse_date_from_text(link.title) or parse_date_from_url(link.url)
-            log = ArticleLog(
-                article_date=article_date,
-                title=link.title,
-                url=link.url,
-                status="error",
-                error=str(exc),
-                found_on_page=link.found_on_page,
-            )
-            article_logs.append(log)
-            if not args.quiet:
-                if args.verbose:
-                    print(
-                        f"{progress_line(idx, len(links), 'Articles')} | "
-                        f"error: {link.title} - {exc}"
-                    )
-                else:
-                    print(
-                        f"{progress_line(idx, len(links), 'Articles')} | "
-                        f"error: {link.title}"
-                    )
-            emit_progress(
-                progress_callback,
-                "article",
-                done=idx,
-                total=len(links),
-                status="error",
-                rows=0,
-                title=link.title,
-                url=link.url,
-                error=str(exc),
-            )
+            except Exception as exc:  # noqa: BLE001 - continue archive scraping after one bad page.
+                article_date = parse_date_from_text(link.title) or parse_date_from_url(link.url)
+                log = ArticleLog(
+                    article_date=article_date,
+                    title=link.title,
+                    url=link.url,
+                    status="error",
+                    error=str(exc),
+                    found_on_page=link.found_on_page,
+                )
+                article_logs.append(log)
+                if not args.quiet:
+                    if args.verbose:
+                        print(
+                            f"{progress_line(idx, len(links), 'Articles')} | "
+                            f"error: {link.title} - {exc}"
+                        )
+                    else:
+                        print(
+                            f"{progress_line(idx, len(links), 'Articles')} | "
+                            f"error: {link.title}"
+                        )
+                emit_progress(
+                    progress_callback,
+                    "article",
+                    done=idx,
+                    total=len(links),
+                    status="error",
+                    rows=0,
+                    title=link.title,
+                    url=link.url,
+                    error=str(exc),
+                )
 
     output_path = Path(args.output)
     run_info = {

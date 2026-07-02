@@ -47,6 +47,16 @@ Useful options:
 .\.venv\Scripts\python.exe app.py --refresh
 ```
 
+Legacy free-text search for older articles before Vietnamnet table coverage:
+
+```powershell
+.\.venv\Scripts\python.exe app.py --legacy --legacy-from-year 2015 --legacy-to-year 2023
+```
+
+The PyQt6 menu also has a checkbox for older free-text news. This mode is best-effort:
+it searches the configured news domains, reads article text, and extracts bank/term/rate
+pairs into the same Excel layout with source URLs for review.
+
 The workbook contains:
 
 - `Summary`: run totals and source info
