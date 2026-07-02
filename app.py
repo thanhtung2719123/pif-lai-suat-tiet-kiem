@@ -383,7 +383,8 @@ def fetch_html(
 
     response = session.get(url, timeout=timeout)
     response.raise_for_status()
-    response.encoding = response.encoding or "utf-8"
+    if not response.encoding or response.encoding.lower() in {"iso-8859-1", "latin-1"}:
+        response.encoding = response.apparent_encoding or "utf-8"
     html = response.text
     path.write_text(html, encoding="utf-8")
     if delay > 0:
@@ -492,23 +493,42 @@ def vietnamese_score(value: str) -> int:
     return sum(1 for char in value.lower() if char in markers)
 
 
+def mojibake_score(value: str) -> int:
+    markers = ("Ã", "Â", "Ä", "Æ", "Å", "áº", "á»", "â€", "â€“", "â€œ", "â€")
+    score = sum(value.count(marker) for marker in markers)
+    score += sum(1 for char in value if "\u0080" <= char <= "\u009f")
+    return score
+
+
 def repair_mojibake(value: str) -> str:
-    try:
-        repaired = value.encode("cp1252", errors="ignore").decode("utf-8", errors="ignore")
-    except UnicodeError:
-        return value
-    return repaired if vietnamese_score(repaired) > vietnamese_score(value) else value
+    candidates = [value]
+    for encoding in ("latin-1", "cp1252"):
+        try:
+            repaired = value.encode(encoding, errors="ignore").decode("utf-8", errors="ignore")
+        except UnicodeError:
+            continue
+        if repaired:
+            candidates.append(repaired)
+
+    def quality(candidate: str) -> tuple[int, int, int]:
+        return (
+            vietnamese_score(candidate) - (mojibake_score(candidate) * 3),
+            -mojibake_score(candidate),
+            len(candidate),
+        )
+
+    return max(candidates, key=quality)
 
 
 def visible_text_from_html(html: str) -> tuple[str, str, date | None]:
     soup = BeautifulSoup(html, "lxml")
-    for tag in soup(["script", "style", "noscript", "svg"]):
-        tag.decompose()
     title = clean_text(
         soup.select_one("h1").get_text(" ", strip=True)
         if soup.select_one("h1")
         else (soup.title.get_text(" ", strip=True) if soup.title else "")
     )
+    for tag in soup(["script", "style", "noscript", "svg"]):
+        tag.decompose()
     text = repair_mojibake(soup.get_text("\n", strip=True))
     title = repair_mojibake(title)
     return title, text, parse_published_date(soup)
@@ -525,6 +545,155 @@ def google_result_url(href: str) -> str:
     if href.startswith("http"):
         return href
     return ""
+
+
+def sitemap_locs(xml_text: str) -> list[str]:
+    return [
+        clean_text(loc).replace("&amp;", "&")
+        for loc in re.findall(r"<(?:\w+:)?loc>(.*?)</(?:\w+:)?loc>", xml_text)
+    ]
+
+
+def date_ranges_overlap(
+    start_a: date,
+    end_a_exclusive: date,
+    start_b: date,
+    end_b_exclusive: date,
+) -> bool:
+    return start_a < end_b_exclusive and start_b < end_a_exclusive
+
+
+def legacy_sitemap_index_url(domain: str) -> str | None:
+    if domain == "infonet.vietnamnet.vn":
+        return "https://infonet.vietnamnet.vn/sitemap.xml"
+    if domain == "cafef.vn":
+        return "https://cafef.vn/sitemap.xml"
+    return None
+
+
+def legacy_sitemap_period(url: str) -> tuple[date, date] | None:
+    infonet = re.search(r"sitemap-article-(\d{2})-(20\d{2})-\d+\.xml", url)
+    if infonet:
+        month = int(infonet.group(1))
+        year = int(infonet.group(2))
+        start = date(year, month, 1)
+        end = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
+        return start, end
+
+    cafef = re.search(r"sitemaps-(20\d{2})-(\d{1,2})-(\d{1,2})-(\d{1,2})\.xml", url)
+    if cafef:
+        year = int(cafef.group(1))
+        month = int(cafef.group(2))
+        start_day = int(cafef.group(3))
+        end_day = int(cafef.group(4))
+        return date(year, month, start_day), date(year, month, end_day) + timedelta(days=1)
+    return None
+
+
+def is_legacy_rate_candidate_url(url: str) -> bool:
+    folded = fold_text(urlsplit(url).path.replace("-", " "))
+    if "lai suat" not in folded:
+        return False
+    strong_savings_tokens = (
+        "tiet kiem",
+        "huy dong",
+        "tien gui",
+        "lai suat cao nhat",
+        "tra lai suat cao",
+        "ngan hang nao tra lai suat",
+    )
+    if not any(token in folded for token in strong_savings_tokens):
+        return False
+    noisy_tokens = ("lien ngan hang", "cho vay", "fed", "trai phieu", "tin dung")
+    return not any(token in folded for token in noisy_tokens)
+
+
+def legacy_sitemap_links_for_domain(
+    session: requests.Session,
+    args: argparse.Namespace,
+    domain: str,
+    period_start: date,
+    period_end_exclusive: date,
+) -> list[str]:
+    index_url = legacy_sitemap_index_url(domain)
+    if not index_url:
+        return []
+
+    try:
+        index_xml = fetch_html(
+            session,
+            index_url,
+            Path(args.cache_dir) / "legacy_sitemaps",
+            args.timeout,
+            args.refresh,
+            args.delay,
+        )
+    except Exception:
+        return []
+
+    sitemap_urls: list[str] = []
+    for sitemap_url in sitemap_locs(index_xml):
+        sitemap_period = legacy_sitemap_period(sitemap_url)
+        if not sitemap_period:
+            continue
+        sitemap_start, sitemap_end = sitemap_period
+        if date_ranges_overlap(
+            sitemap_start,
+            sitemap_end,
+            period_start,
+            period_end_exclusive,
+        ):
+            sitemap_urls.append(sitemap_url)
+
+    links: list[str] = []
+    seen: set[str] = set()
+    for sitemap_url in sitemap_urls:
+        try:
+            sitemap_xml = fetch_html(
+                session,
+                sitemap_url,
+                Path(args.cache_dir) / "legacy_sitemaps",
+                args.timeout,
+                args.refresh,
+                args.delay,
+            )
+        except Exception:
+            continue
+
+        for article_url in sitemap_locs(sitemap_xml):
+            link = canonical_url(article_url)
+            if not link or link in seen or not allowed_legacy_url(link):
+                continue
+            if not is_legacy_rate_candidate_url(link):
+                continue
+            links.append(link)
+            seen.add(link)
+            if len(links) >= args.legacy_max_results:
+                return links
+    return links
+
+
+def legacy_sitemap_links(
+    session: requests.Session,
+    args: argparse.Namespace,
+    period_start: date,
+    period_end_exclusive: date,
+) -> list[str]:
+    links: list[str] = []
+    seen: set[str] = set()
+    for domain in LEGACY_PRIORITY_DOMAINS:
+        for link in legacy_sitemap_links_for_domain(
+            session,
+            args,
+            domain,
+            period_start,
+            period_end_exclusive,
+        ):
+            if link in seen:
+                continue
+            links.append(link)
+            seen.add(link)
+    return links
 
 
 def legacy_period_ranges(start: date, end: date, period: str) -> Iterable[tuple[date, date]]:
@@ -547,8 +716,11 @@ def google_search_links(
     period_start: date,
     period_end_exclusive: date,
 ) -> list[str]:
-    links: list[str] = []
-    seen: set[str] = set()
+    links = legacy_sitemap_links(session, args, period_start, period_end_exclusive)
+    seen: set[str] = set(links)
+    if links:
+        return links
+
     priority = [domain for domain in LEGACY_PRIORITY_DOMAINS if domain in LEGACY_DOMAINS]
     remaining = [domain for domain in LEGACY_DOMAINS if domain not in priority]
     domain_groups = [[domain] for domain in priority] + [remaining]
@@ -759,6 +931,11 @@ def collect_table_header(lines: list[str], start: int) -> tuple[list[int | None]
     return header_terms, cursor
 
 
+def is_legacy_table_header_start(value: str) -> bool:
+    folded = fold_text(value)
+    return folded in {"ngan hang", "ngan hang lai suat"}
+
+
 def align_legacy_table_values(
     values: list[float | None],
     header_terms: list[int | None],
@@ -823,7 +1000,7 @@ def extract_linear_legacy_tables(
 
     index = 0
     while index < len(lines):
-        if "ngan hang" not in fold_text(lines[index]):
+        if not is_legacy_table_header_start(lines[index]):
             index += 1
             continue
         header = collect_table_header(lines, index)
@@ -840,7 +1017,7 @@ def extract_linear_legacy_tables(
         while cursor < len(lines):
             line = lines[cursor]
             folded = fold_text(line)
-            if "ngan hang" in folded and collect_table_header(lines, cursor):
+            if is_legacy_table_header_start(line) and collect_table_header(lines, cursor):
                 finish_row(current_bank, current_values, header_terms)
                 break
             if folded.startswith("tiep tuc cap nhat"):
