@@ -8,6 +8,7 @@ from pathlib import Path
 from PyQt6.QtCore import QObject, Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QFont, QIcon, QPixmap
 from PyQt6.QtWidgets import (
+    QAbstractSpinBox,
     QApplication,
     QCheckBox,
     QComboBox,
@@ -21,6 +22,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QProgressBar,
+    QSizePolicy,
     QSpinBox,
     QTextEdit,
     QVBoxLayout,
@@ -127,17 +129,26 @@ class PassionInvestmentWindow(QMainWindow):
         form = QGridLayout()
         form.setHorizontalSpacing(14)
         form.setVerticalSpacing(14)
+        form.setColumnMinimumWidth(0, 150)
+        form.setColumnMinimumWidth(1, 230)
+        form.setColumnMinimumWidth(2, 110)
+        form.setColumnStretch(1, 1)
 
         self.pages_spin = QSpinBox()
         self.pages_spin.setRange(1, 5000)
         self.pages_spin.setValue(500)
+        self._configure_number_input(self.pages_spin)
 
         self.stop_empty_spin = QSpinBox()
         self.stop_empty_spin.setRange(0, 100)
         self.stop_empty_spin.setValue(8)
+        self._configure_number_input(self.stop_empty_spin)
 
         self.output_edit = QLineEdit(str(DEFAULT_OUTPUT))
+        self.output_edit.setMinimumWidth(320)
+        self.output_edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         browse_button = QPushButton("Browse")
+        browse_button.setMinimumWidth(100)
         browse_button.clicked.connect(self._browse_output)
 
         self.refresh_checkbox = QCheckBox("Refresh downloaded pages instead of cache")
@@ -146,12 +157,15 @@ class PassionInvestmentWindow(QMainWindow):
         self.legacy_from_year_spin = QSpinBox()
         self.legacy_from_year_spin.setRange(2015, 2023)
         self.legacy_from_year_spin.setValue(2017)
+        self._configure_number_input(self.legacy_from_year_spin)
         self.legacy_to_year_spin = QSpinBox()
         self.legacy_to_year_spin.setRange(2015, 2023)
         self.legacy_to_year_spin.setValue(2022)
+        self._configure_number_input(self.legacy_to_year_spin)
         self.legacy_period_combo = QComboBox()
         self.legacy_period_combo.addItem("Monthly search", "month")
         self.legacy_period_combo.addItem("Daily search", "day")
+        self.legacy_period_combo.setMinimumWidth(230)
 
         form.addWidget(self._field_label("Pages to scan"), 0, 0)
         form.addWidget(self.pages_spin, 0, 1)
@@ -225,8 +239,10 @@ class PassionInvestmentWindow(QMainWindow):
         status_layout.addWidget(self.summary_label)
         status_layout.addWidget(self.log_box, stretch=1)
 
-        content_row.addWidget(controls_card, stretch=4)
-        content_row.addWidget(status_card, stretch=6)
+        controls_card.setMinimumWidth(520)
+        status_card.setMinimumWidth(420)
+        content_row.addWidget(controls_card, stretch=5)
+        content_row.addWidget(status_card, stretch=5)
 
         self.setStyleSheet(
             """
@@ -282,15 +298,28 @@ class PassionInvestmentWindow(QMainWindow):
                 border: 1px solid #b7dcc3;
                 border-radius: 12px;
                 padding: 10px 12px;
+                color: #123d27;
+                selection-background-color: #bdeccb;
+                selection-color: #123d27;
+                min-height: 22px;
             }
             QLineEdit:focus, QSpinBox:focus, QTextEdit:focus {
                 border: 2px solid #18a14b;
+            }
+            QSpinBox {
+                min-width: 150px;
+            }
+            QSpinBox::up-button, QSpinBox::down-button {
+                width: 0px;
+                border: 0px;
             }
             QComboBox {
                 background: #fcfffd;
                 border: 1px solid #b7dcc3;
                 border-radius: 12px;
                 padding: 10px 12px;
+                color: #123d27;
+                min-height: 22px;
             }
             QComboBox:focus {
                 border: 2px solid #18a14b;
@@ -351,6 +380,15 @@ class PassionInvestmentWindow(QMainWindow):
             }
             """
         )
+
+    def _configure_number_input(self, spinbox: QSpinBox) -> None:
+        spinbox.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        spinbox.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        spinbox.setMinimumWidth(180)
+        spinbox.setMinimumHeight(42)
+        spinbox.setKeyboardTracking(False)
+        spinbox.lineEdit().setCursorPosition(0)
+        spinbox.lineEdit().setClearButtonEnabled(False)
 
     def _field_label(self, text: str) -> QLabel:
         label = QLabel(text)
