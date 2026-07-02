@@ -1,0 +1,5 @@
+beautifulsoup4==4.15.0
+lxml==6.1.1
+openpyxl==3.1.5
+PyQt6==6.9.1
+requests==2.34.2
